@@ -44,6 +44,9 @@
 #include "odom_estimation.h"
 #include <robot_pose_ekf/GetStatus.h>
 
+#include <message_filters/subscriber.h>
+#include <tf/message_filter.h>
+
 // messages
 #include "nav_msgs/Odometry.h"
 #include "geometry_msgs/Twist.h"
@@ -106,8 +109,13 @@ private:
   ros::NodeHandle node_;
   ros::Timer timer_;
   ros::Publisher pose_pub_;
-  ros::Subscriber odom_sub_, imu_sub_, vo_sub_,gps_sub_;
+  ros::Subscriber odom_sub_, gps_sub_;
   ros::ServiceServer state_srv_;
+
+  message_filters::Subscriber<nav_msgs::Odometry> vo_sub_;
+  tf::MessageFilter<nav_msgs::Odometry> *vo_filter_;
+  message_filters::Subscriber<sensor_msgs::Imu> imu_sub_;
+  tf::MessageFilter<sensor_msgs::Imu> *imu_filter_;
 
   // ekf filter
   OdomEstimation my_filter_;

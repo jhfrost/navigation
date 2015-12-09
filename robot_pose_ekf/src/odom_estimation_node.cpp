@@ -101,7 +101,7 @@ namespace estimation
     timer_ = nh_private.createTimer(ros::Duration(1.0/max(freq,1.0)), &OdomEstimationNode::spin, this);
 
     // advertise our estimation
-    pose_pub_ = nh_private.advertise<geometry_msgs::PoseWithCovarianceStamped>("odom_combined", 10);
+    pose_pub_ = nh_private.advertise<nav_msgs::Odometry>(output_frame_, 10);
 
     // initialize
     filter_stamp_ = Time::now();
@@ -110,20 +110,27 @@ namespace estimation
     if (odom_used_){
       ROS_DEBUG("Odom sensor can be used");
       odom_sub_ = nh.subscribe("odom", 10, &OdomEstimationNode::odomCallback, this);
+      odom_covariance_ = 0;
     }
     else ROS_DEBUG("Odom sensor will NOT be used");
 
     // subscribe to imu messages
     if (imu_used_){
       ROS_DEBUG("Imu sensor can be used");
-      imu_sub_ = nh.subscribe("imu_data", 10,  &OdomEstimationNode::imuCallback, this);
+      imu_sub_.subscribe(nh, "imu_data", 10);
+      imu_filter_ = new tf::MessageFilter<sensor_msgs::Imu>(imu_sub_, robot_state_, base_footprint_frame_, 10);
+      imu_filter_->registerCallback(boost::bind(&OdomEstimationNode::imuCallback, this, _1));
+      imu_covariance_ = 0;
     }
     else ROS_DEBUG("Imu sensor will NOT be used");
 
     // subscribe to vo messages
     if (vo_used_){
       ROS_DEBUG("VO sensor can be used");
-      vo_sub_ = nh.subscribe("vo", 10, &OdomEstimationNode::voCallback, this);
+      vo_sub_.subscribe(nh, "vo", 10);
+      vo_filter_ = new tf::MessageFilter<nav_msgs::Odometry>(vo_sub_, robot_state_, base_footprint_frame_, 10);
+      vo_filter_->registerCallback(boost::bind(&OdomEstimationNode::voCallback, this, _1));
+      vo_covariance_ = 0;
     }
     else ROS_DEBUG("VO sensor will NOT be used");
 
@@ -146,7 +153,7 @@ namespace estimation
       corr_file_.open("/tmp/corr_file.txt");
 
   
-    }
+    }    
   };
 
 
@@ -187,24 +194,35 @@ namespace estimation
       for (unsigned int j=0; j<6; j++)
         odom_covariance_(i+1, j+1) = odom->pose.covariance[6*i+j];
 
+    if (odom_covariance_(1,1) == 0.0){
+      SymmetricMatrix measNoiseOdom_Cov(6); measNoiseOdom_Cov = 0;
+      measNoiseOdom_Cov(1,1) = pow(0.01,2);  // = 0.01 m / sec
+      measNoiseOdom_Cov(2,2) = pow(0.01,2);  // = 0.01 m / sec
+      measNoiseOdom_Cov(3,3) = pow(0.01,2);  // = 0.01 m / sec
+      measNoiseOdom_Cov(4,4) = pow(5. * M_PI / 180.,2);  // = 5 degrees / sec
+      measNoiseOdom_Cov(5,5) = pow(5. * M_PI / 180.,2);  // = 5 degrees / sec
+      measNoiseOdom_Cov(6,6) = pow(5. * M_PI / 180.,2);  // = 5 degrees / sec
+      odom_covariance_ = measNoiseOdom_Cov;
+    }
+
     my_filter_.addMeasurement(StampedTransform(odom_meas_.inverse(), odom_stamp_, base_footprint_frame_, "wheelodom"), odom_covariance_);
     
     // activate odom
     if (!odom_active_) {
       if (!odom_initializing_){
-	odom_initializing_ = true;
-	odom_init_stamp_ = odom_stamp_;
-	ROS_INFO("Initializing Odom sensor");      
+        odom_initializing_ = true;
+        odom_init_stamp_ = odom_stamp_;
+        ROS_INFO("Initializing Odom sensor");
       }
       if ( filter_stamp_ >= odom_init_stamp_){
-	odom_active_ = true;
-	odom_initializing_ = false;
-	ROS_INFO("Odom sensor activated");      
+        odom_active_ = true;
+        odom_initializing_ = false;
+        ROS_INFO("Odom sensor activated");
       }
-      else ROS_DEBUG("Waiting to activate Odom, because Odom measurements are still %f sec in the future.", 
-		    (odom_init_stamp_ - filter_stamp_).toSec());
+      else ROS_DEBUG("Waiting to activate Odom, because Odom measurements are still %f sec in the future.",
+                     (odom_init_stamp_ - filter_stamp_).toSec());
     }
-    
+
     if (debug_){
       // write to file
       double tmp, yaw;
@@ -233,54 +251,50 @@ namespace estimation
         imu_covariance_(i+1, j+1) = imu->orientation_covariance[3*i+j];
 
     // Transforms imu data to base_footprint frame
-    if (!robot_state_.waitForTransform(base_footprint_frame_, imu->header.frame_id, imu_stamp_, ros::Duration(0.5))){
-      // warn when imu was already activated, not when imu is not active yet
-      if (imu_active_)
-        ROS_ERROR("Could not transform imu message from %s to %s", imu->header.frame_id.c_str(), base_footprint_frame_.c_str());
-      else if (my_filter_.isInitialized())
-        ROS_WARN("Could not transform imu message from %s to %s. Imu will not be activated yet.", imu->header.frame_id.c_str(), base_footprint_frame_.c_str());
-      else 
-        ROS_DEBUG("Could not transform imu message from %s to %s. Imu will not be activated yet.", imu->header.frame_id.c_str(), base_footprint_frame_.c_str());
-      return;
-    }
     StampedTransform base_imu_offset;
-    robot_state_.lookupTransform(base_footprint_frame_, imu->header.frame_id, imu_stamp_, base_imu_offset);
-    imu_meas_ = imu_meas_ * base_imu_offset;
+    try {
+        robot_state_.lookupTransform(base_footprint_frame_, imu->header.frame_id, imu_stamp_, base_imu_offset);
+        imu_meas_ = base_imu_offset * imu_meas_ * base_imu_offset.inverse();
 
-    imu_time_  = Time::now();
+        imu_time_  = Time::now();
 
-    // manually set covariance untile imu sends covariance
-    if (imu_covariance_(1,1) == 0.0){
-      SymmetricMatrix measNoiseImu_Cov(3);  measNoiseImu_Cov = 0;
-      measNoiseImu_Cov(1,1) = pow(0.00017,2);  // = 0.01 degrees / sec
-      measNoiseImu_Cov(2,2) = pow(0.00017,2);  // = 0.01 degrees / sec
-      measNoiseImu_Cov(3,3) = pow(0.00017,2);  // = 0.01 degrees / sec
-      imu_covariance_ = measNoiseImu_Cov;
-    }
+        // manually set covariance until imu sends covariance
+        if (imu_covariance_(1,1) == 0.0){
+          SymmetricMatrix measNoiseImu_Cov(3);  measNoiseImu_Cov = 0;
+          measNoiseImu_Cov(1,1) = pow(0.00017,2);  // = 0.01 degrees / sec
+          measNoiseImu_Cov(2,2) = pow(0.00017,2);  // = 0.01 degrees / sec
+          measNoiseImu_Cov(3,3) = pow(0.00017,2);  // = 0.01 degrees / sec
+          imu_covariance_ = measNoiseImu_Cov;
+        }
 
-    my_filter_.addMeasurement(StampedTransform(imu_meas_.inverse(), imu_stamp_, base_footprint_frame_, "imu"), imu_covariance_);
-    
-    // activate imu
-    if (!imu_active_) {
-      if (!imu_initializing_){
-	imu_initializing_ = true;
-	imu_init_stamp_ = imu_stamp_;
-	ROS_INFO("Initializing Imu sensor");      
-      }
-      if ( filter_stamp_ >= imu_init_stamp_){
-	imu_active_ = true;
-	imu_initializing_ = false;
-	ROS_INFO("Imu sensor activated");      
-      }
-      else ROS_DEBUG("Waiting to activate IMU, because IMU measurements are still %f sec in the future.", 
-		    (imu_init_stamp_ - filter_stamp_).toSec());
-    }
-    
-    if (debug_){
-      // write to file
-      double tmp, yaw;
-      imu_meas_.getBasis().getEulerYPR(yaw, tmp, tmp); 
-      imu_file_ <<fixed<<setprecision(5)<<ros::Time::now().toSec()<<" "<< yaw << endl;
+        my_filter_.addMeasurement(StampedTransform(imu_meas_.inverse(), imu_stamp_, base_footprint_frame_, "imu"), imu_covariance_);
+
+        // activate imu
+        if (!imu_active_) {
+            if (!imu_initializing_){
+                imu_initializing_ = true;
+                imu_init_stamp_ = imu_stamp_;
+                ROS_INFO("Initializing Imu sensor");
+            }
+            if ( filter_stamp_ >= imu_init_stamp_){
+                imu_active_ = true;
+                imu_initializing_ = false;
+                ROS_INFO("Imu sensor activated");
+            }
+            else ROS_DEBUG("Waiting to activate IMU, because IMU measurements are still %f sec in the future.",
+                           (imu_init_stamp_ - filter_stamp_).toSec());
+        }
+
+        if (debug_){
+            // write to file
+            double tmp, yaw;
+            imu_meas_.getBasis().getEulerYPR(yaw, tmp, tmp);
+            imu_file_ <<fixed<<setprecision(5)<<ros::Time::now().toSec()<<" "<< yaw << endl;
+        }
+    } catch (tf::LookupException le) {
+        ROS_ERROR("Couldn't find transformation between %s and %s", imu->header.frame_id.c_str(), base_footprint_frame_.c_str());
+    } catch (tf::ExtrapolationException ee) {
+        ROS_ERROR("IMU tranformation lookup time is in the future");
     }
   };
 
@@ -301,30 +315,53 @@ namespace estimation
     for (unsigned int i=0; i<6; i++)
       for (unsigned int j=0; j<6; j++)
         vo_covariance_(i+1, j+1) = vo->pose.covariance[6*i+j];
-    my_filter_.addMeasurement(StampedTransform(vo_meas_.inverse(), vo_stamp_, base_footprint_frame_, "vo"), vo_covariance_);
-    
-    // activate vo
-    if (!vo_active_) {
-      if (!vo_initializing_){
-	vo_initializing_ = true;
-	vo_init_stamp_ = vo_stamp_;
-	ROS_INFO("Initializing Vo sensor");      
+
+    // Transforms VO data to base_footprint frame
+    StampedTransform base_vo_offset;
+    try {
+      robot_state_.lookupTransform(base_footprint_frame_, vo->header.frame_id, vo_stamp_, base_vo_offset);
+      vo_meas_ = base_vo_offset * vo_meas_ * base_vo_offset.inverse();
+
+      if (vo_covariance_(1,1) == 0.0){
+        SymmetricMatrix measNoiseVo_Cov(6);  measNoiseVo_Cov = 0;
+        measNoiseVo_Cov(1,1) = pow(0.05,2);  // = 0.05 m / sec
+        measNoiseVo_Cov(2,2) = pow(0.05,2);  // = 0.05 m / sec
+        measNoiseVo_Cov(3,3) = pow(0.05,2);  // = 0.05 m / sec
+        measNoiseVo_Cov(4,4) = pow(10. * M_PI / 180.,2);  // = 10 degrees / sec
+        measNoiseVo_Cov(5,5) = pow(10. * M_PI / 180.,2);  // = 10 degrees / sec
+        measNoiseVo_Cov(6,6) = pow(10. * M_PI / 180.,2);  // = 10 degrees / sec
+        vo_covariance_ = measNoiseVo_Cov;
       }
-      if (filter_stamp_ >= vo_init_stamp_){
-	vo_active_ = true;
-	vo_initializing_ = false;
-	ROS_INFO("Vo sensor activated");      
+
+      my_filter_.addMeasurement(StampedTransform(vo_meas_.inverse(), vo_stamp_, base_footprint_frame_, "vo"), vo_covariance_);
+
+      // activate vo
+      if (!vo_active_) {
+        if (!vo_initializing_){
+          vo_initializing_ = true;
+          vo_init_stamp_ = vo_stamp_;
+          ROS_INFO("Initializing Vo sensor");
+        }
+        if (filter_stamp_ >= vo_init_stamp_){
+          vo_active_ = true;
+          vo_initializing_ = false;
+          ROS_INFO("Vo sensor activated");
+        }
+        else ROS_DEBUG("Waiting to activate VO, because VO measurements are still %f sec in the future.",
+                       (vo_init_stamp_ - filter_stamp_).toSec());
       }
-      else ROS_DEBUG("Waiting to activate VO, because VO measurements are still %f sec in the future.", 
-		    (vo_init_stamp_ - filter_stamp_).toSec());
-    }
-    
-    if (debug_){
-      // write to file
-      double Rx, Ry, Rz;
-      vo_meas_.getBasis().getEulerYPR(Rz, Ry, Rx);
-      vo_file_ <<fixed<<setprecision(5)<<ros::Time::now().toSec()<<" "<< vo_meas_.getOrigin().x() << " " << vo_meas_.getOrigin().y() << " " << vo_meas_.getOrigin().z() << " "
-               << Rx << " " << Ry << " " << Rz << endl;
+
+      if (debug_){
+        // write to file
+        double Rx, Ry, Rz;
+        vo_meas_.getBasis().getEulerYPR(Rz, Ry, Rx);
+        vo_file_ <<fixed<<setprecision(5)<<ros::Time::now().toSec()<<" "<< vo_meas_.getOrigin().x() << " " << vo_meas_.getOrigin().y() << " " << vo_meas_.getOrigin().z() << " "
+                 << Rx << " " << Ry << " " << Rz << endl;
+      }
+    } catch (tf::LookupException le) {
+      ROS_ERROR("Couldn't find transformation between %s and %s", vo->header.frame_id.c_str(), base_footprint_frame_.c_str());
+    } catch (tf::ExtrapolationException ee) {
+      ROS_ERROR("VO tranformation lookup time is in the future");
     }
   };
 
@@ -378,9 +415,11 @@ namespace estimation
       double diff = fabs( Duration(odom_stamp_ - imu_stamp_).toSec() );
       if (diff > 1.0) ROS_ERROR("Timestamps of odometry and imu are %f seconds apart.", diff);
     }
-    
+
     // initial value for filter stamp; keep this stamp when no sensors are active
-    filter_stamp_ = Time::now();
+    ros::Time time_now = Time::now();
+    ros::Duration time_diff = time_now - filter_stamp_;
+    filter_stamp_ = time_now;
     
     // check which sensors are still active
     if ((odom_active_ || odom_initializing_) && 
@@ -414,16 +453,37 @@ namespace estimation
       if (imu_active_)   filter_stamp_ = min(filter_stamp_, imu_stamp_);
       if (vo_active_)    filter_stamp_ = min(filter_stamp_, vo_stamp_);
       if (gps_active_)  filter_stamp_ = min(filter_stamp_, gps_stamp_);
-
       
       // update filter
+      geometry_msgs::PoseWithCovarianceStamped output_last = output_;
+      tf::Quaternion q_last;
+      double roll_last, pitch_last, yaw_last;
+      tf::quaternionMsgToTF(output_last.pose.pose.orientation, q_last);
+      tf::Matrix3x3(q_last).getRPY(roll_last, pitch_last, yaw_last);
+
       if ( my_filter_.isInitialized() )  {
         bool diagnostics = true;
         if (my_filter_.update(odom_active_, imu_active_,gps_active_, vo_active_,  filter_stamp_, diagnostics)){
           
-          // output most recent estimate and relative covariance
+          // output most recent estimate and movement speed as odometry message.
           my_filter_.getEstimate(output_);
-          pose_pub_.publish(output_);
+          nav_msgs::Odometry odom_msg;
+          odom_msg.header = output_.header;
+          odom_msg.pose = output_.pose;
+          if (ekf_sent_counter_ > 0 && time_diff.toSec() < 1.0) {   // Estimate velocity
+              odom_msg.twist.twist.linear.x = (output_.pose.pose.position.x - output_last.pose.pose.position.x) / time_diff.toSec();
+              odom_msg.twist.twist.linear.y = (output_.pose.pose.position.y - output_last.pose.pose.position.y) / time_diff.toSec();
+              odom_msg.twist.twist.linear.z = (output_.pose.pose.position.z - output_last.pose.pose.position.z) / time_diff.toSec();
+
+              tf::Quaternion q;
+              double roll, pitch, yaw;
+              tf::quaternionMsgToTF(output_.pose.pose.orientation, q);
+              tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
+              odom_msg.twist.twist.angular.x = (roll - roll_last) / time_diff.toSec();
+              odom_msg.twist.twist.angular.y = (pitch - pitch_last) / time_diff.toSec();
+              odom_msg.twist.twist.angular.z = (yaw - yaw_last) / time_diff.toSec();
+          }
+          pose_pub_.publish(odom_msg);
           ekf_sent_counter_++;
           
           // broadcast most recent estimate to TransformArray
@@ -443,6 +503,10 @@ namespace estimation
             corr_file_ << estimate(i) << " ";
             corr_file_ << endl;
           }
+
+          imu_covariance_ = 0;
+          odom_covariance_ = 0;
+          vo_covariance_ = 0;
         }
         if (self_diagnose_ && !diagnostics)
           ROS_WARN("Robot pose ekf diagnostics discovered a potential problem");
@@ -451,7 +515,7 @@ namespace estimation
 
       // initialize filer with odometry frame
       if (imu_active_ && gps_active_ && !my_filter_.isInitialized()) {
-	Quaternion q = imu_meas_.getRotation();
+        Quaternion q = imu_meas_.getRotation();
         Vector3 p = gps_meas_.getOrigin();
         Transform init_meas_ = Transform(q, p);
         my_filter_.initialize(init_meas_, gps_stamp_);
